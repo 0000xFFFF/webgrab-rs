@@ -1,0 +1,5 @@
+- reimplement webgrab in rust
+- replace all flags with normal --flag -f flags don't use @
+- make reading html possible, reading line by line etc
+- dupe dir
+- make a unique option that downloads file compares hash to previously downloaded files if it exist delete file that was downloaded and move to the next
