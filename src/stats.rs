@@ -1,0 +1,17 @@
+use std::sync::atomic::{AtomicU64, AtomicUsize};
+
+/// Thread-safe counters.
+#[derive(Default)]
+pub struct Stats {
+    pub total: AtomicUsize,      // every candidate found
+    pub accepted: AtomicUsize,   // passed the filters
+    pub processed: AtomicUsize,  // download attempts started
+    pub dled: AtomicUsize,       // files saved
+    pub bytes: AtomicU64,        // bytes saved
+    pub renamed: AtomicUsize,    // name clash -> "name [1].ext"
+    pub replaced: AtomicUsize,   // name clash -> overwritten (--replace)
+    pub hash_dupes: AtomicUsize, // identical content -> deleted (--nodupes)
+    pub skipped: AtomicUsize,    // skipped by the --skip* rules
+    pub disposed: AtomicUsize,   // rejected by filters / --unique
+    pub failed: AtomicUsize,
+}

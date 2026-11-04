@@ -1,0 +1,61 @@
+use crate::cli::Cli;
+use url::Url;
+
+pub const TYPES_VIDEO: &[&str] = &[
+    ".mp4", ".webm", ".avi", ".mov", ".mkv", ".flv", ".mpeg", ".mpg", ".wmv", ".mp3", ".ogg",
+];
+pub const TYPES_IMAGE: &[&str] = &[
+    ".jpg", ".jpeg", ".jpe", ".jiff", ".jfif", ".png", ".gif", ".ico", ".svg", ".bmp", ".dib",
+    ".tif", ".tiff",
+];
+pub const TYPES_OTHER: &[&str] = &[".zip", ".rar", ".exe", ".swf", ".dll", ".txt"];
+pub const TYPES_CODEC: &[&str] = &[
+    ".asp", ".aspx", ".axd", ".asx", ".asmx", ".ashx", ".css", ".cfm", ".yaws", ".swf", ".html",
+    ".htm", ".xhtml", ".jhtml", ".jsp", ".jspx", ".wss", ".do", ".action", ".js", ".pl", ".php",
+    ".php4", ".php3", ".phtml", ".py", ".rb", ".rhtml", ".shtml", ".xml", ".rss", ".svg", ".cgi",
+    ".dll",
+];
+
+pub fn is_http(link: &str) -> bool {
+    Url::parse(link)
+        .map(|u| matches!(u.scheme(), "http" | "https"))
+        .unwrap_or(false)
+}
+
+/// Keyword rules, case-insensitive substring matching (same semantics as the C# version):
+///   only   = at least one must be present
+///   must   = all must be present
+///   ignore = none may be present
+pub struct Filters {
+    only: Vec<String>,
+    must: Vec<String>,
+    ignore: Vec<String>,
+    valid: bool,
+}
+
+impl Filters {
+    pub fn new(cli: &Cli) -> Self {
+        let lc = |v: &Vec<String>| v.iter().map(|s| s.to_lowercase()).collect::<Vec<_>>();
+        Self { only: lc(&cli.only), must: lc(&cli.must), ignore: lc(&cli.ignore), valid: cli.valid }
+    }
+
+    pub fn passes(&self, link: &str) -> bool {
+        if link.is_empty() {
+            return false;
+        }
+        if self.valid && !is_http(link) {
+            return false;
+        }
+        let l = link.to_lowercase();
+        if !self.only.is_empty() && !self.only.iter().any(|k| l.contains(k.as_str())) {
+            return false;
+        }
+        if !self.must.iter().all(|k| l.contains(k.as_str())) {
+            return false;
+        }
+        if self.ignore.iter().any(|k| l.contains(k.as_str())) {
+            return false;
+        }
+        true
+    }
+}
