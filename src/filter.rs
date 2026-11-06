@@ -23,7 +23,7 @@ pub fn is_http(link: &str) -> bool {
 }
 
 /// Keyword rules, case-insensitive substring matching (same semantics as the C# version):
-///   only   = at least one must be present
+///   any    = at least one must be present
 ///   must   = all must be present
 ///   ignore = none may be present
 pub struct Filters {
@@ -36,7 +36,7 @@ pub struct Filters {
 impl Filters {
     pub fn new(cli: &Cli) -> Self {
         let lc = |v: &Vec<String>| v.iter().map(|s| s.to_lowercase()).collect::<Vec<_>>();
-        Self { only: lc(&cli.only), must: lc(&cli.must), ignore: lc(&cli.ignore), valid: cli.valid }
+        Self { only: lc(&cli.any), must: lc(&cli.must), ignore: lc(&cli.ignore), valid: cli.valid }
     }
 
     pub fn passes(&self, link: &str) -> bool {

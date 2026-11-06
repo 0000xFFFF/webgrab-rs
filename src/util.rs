@@ -66,10 +66,25 @@ pub fn split_name(name: &str) -> (&str, &str) {
     }
 }
 
-/// Name without its last extension (used by --skip-ext).
-pub fn strip_ext(name: &str) -> &str {
-    match name.rfind('.') {
-        Some(i) => &name[..i],
-        None => name,
+/// All regular files in `dir` (and below, when `recursive`). Symlinked dirs are not followed.
+pub fn walk_files(dir: &std::path::Path, recursive: bool) -> Vec<std::path::PathBuf> {
+    fn go(dir: &std::path::Path, recursive: bool, out: &mut Vec<std::path::PathBuf>) {
+        if let Ok(rd) = std::fs::read_dir(dir) {
+            for e in rd.flatten() {
+                let p = e.path();
+                match e.file_type() {
+                    Ok(ft) if ft.is_dir() => {
+                        if recursive {
+                            go(&p, true, out);
+                        }
+                    }
+                    Ok(ft) if ft.is_file() => out.push(p),
+                    _ => {}
+                }
+            }
+        }
     }
+    let mut out = Vec::new();
+    go(dir, recursive, &mut out);
+    out
 }

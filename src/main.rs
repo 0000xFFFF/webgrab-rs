@@ -1,9 +1,11 @@
 mod cli;
+mod csvlog;
 mod download;
 mod filter;
 mod scan;
 mod skip;
 mod stats;
+mod ua;
 mod ui;
 mod util;
 
@@ -110,7 +112,7 @@ fn page_mode(ctx: &Ctx, input: &str) -> u8 {
             ui.say(K::Top, "===[ DOWNLOADING HTML ]");
             ui.say(K::Cur, &format!("DING..: {}", input));
         }
-        match ctx.agent.get(input).call() {
+        match ctx.get(input).call() {
             Ok(resp) => {
                 base = Url::parse(resp.get_url()).ok(); // after redirects
                 let mut buf = Vec::new();

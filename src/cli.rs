@@ -5,14 +5,23 @@ use std::path::PathBuf;
 
 const EXAMPLES: &str = "\
 Flags can be written with two dashes (--threads 4) or one dash (-threads 4).
-Underscores work too (--skip_all).
+Hyphens and underscores are interchangeable (--skip-all = --skip_all).
+Short flags (-t, -d, -R ...) take their value after a space and can't be combined.
+
+SKIP / DUPLICATE RULES (what each one checks):
+  --unique     the same URL is queued only once
+  --nodupes    the same file CONTENT (sha256) is kept only once
+  --skip       the same file NAME already exists in --dir
+               (only the name is compared! if two different links give different files
+               with the same name, --skip and --replace can treat them as one file)
+  --live-csv   remembers every URL/file/hash it handled, so re-running the same command resumes
 
 EXAMPLES:
   webgrab https://example.com/gallery --grab --threads 8
   webgrab https://example.com/gallery --list --image --unique
   webgrab page.html --list --base https://example.com/ --video
-  webgrab https://example.com --image --nodupes --export-hashes hashes.txt
-  webgrab --read urls.txt --media --threads 4 --dir downloads
+  webgrab --live-csv data.csv --nodupes --unique download_links.html
+  webgrab --read urls.txt --media -t 4 -d downloads --live-csv log.csv --hash-existing -R
   webgrab \"https://www.youtube.com/watch?v=XXXXXXXXXXX\" --valid --image --unique --must maxres";
 
 #[derive(Parser, Debug)]
@@ -30,19 +39,19 @@ pub struct Cli {
 
     // ---------------------------------------------------------------- modes
     /// Only print the links found (no downloading). Great for reading an .html file
-    #[arg(long, visible_aliases = ["out", "echo", "print", "output"], help_heading = "Modes")]
+    #[arg(short = 'l', long, help_heading = "Modes")]
     pub list: bool,
 
-    /// No downloading, just print counts (size, title, total/accepted/skipped/rejected)
-    #[arg(long, visible_aliases = ["ping", "try"], help_heading = "Modes")]
+    /// No downloading, just print counts (size, title, total/accepted/rejected)
+    #[arg(short = 'T', long, help_heading = "Modes")]
     pub test: bool,
 
     /// Read a text file and treat every line as a URL (empty lines and '#' lines ignored)
-    #[arg(long, visible_aliases = ["txt", "text"], value_name = "FILE", help_heading = "Modes")]
+    #[arg(short = 'r', long, value_name = "FILE", help_heading = "Modes")]
     pub read: Option<PathBuf>,
 
     /// Download URLs as they are copied to the clipboard
-    #[arg(long, visible_alias = "listen", help_heading = "Modes")]
+    #[arg(short = 'w', long, help_heading = "Modes")]
     pub watch: bool,
 
     // ------------------------------------------------------------- download
@@ -51,90 +60,100 @@ pub struct Cli {
     pub threads: usize,
 
     /// Save files into this directory (created if missing)
-    #[arg(long, value_name = "DIR", help_heading = "Download")]
+    #[arg(short = 'd', long, value_name = "DIR", help_heading = "Download")]
     pub dir: Option<PathBuf>,
+
+    /// Search subdirectories too (for --skip and --hash-existing)
+    #[arg(short = 'R', long, help_heading = "Download")]
+    pub recursive: bool,
 
     /// Only keep valid http(s) URLs
     #[arg(long, help_heading = "Download")]
     pub valid: bool,
 
-    /// Only keep the first occurrence of every URL (de-duplicates the download list)
-    #[arg(long, help_heading = "Download")]
+    /// Only queue every URL once
+    #[arg(short = 'u', long, help_heading = "Download")]
     pub unique: bool,
 
-    /// After each download hash the file; if the same content was already downloaded, delete the new file
-    #[arg(long, help_heading = "Download")]
+    /// Keep file content unique: hash every download, delete it if the same content was already saved
+    #[arg(short = 'n', long, help_heading = "Download")]
     pub nodupes: bool,
 
-    /// Hash the files already in --dir first so --nodupes also catches those (implies --nodupes)
-    #[arg(long, help_heading = "Download")]
+    /// Hash the files already in --dir (and in subdirectories with -R) before downloading
+    ///
+    /// The hashes feed --nodupes; with --live-csv they are also written to the CSV
+    /// (blank url, is_dupe=0).
+    #[arg(short = 'H', long, help_heading = "Download")]
     pub hash_existing: bool,
 
-    /// Write "<sha256>  <filename>" for every saved file; updated live after each download
-    #[arg(long, value_name = "FILE", help_heading = "Download")]
-    pub export_hashes: Option<PathBuf>,
-
-    /// Append to the --export-hashes file instead of overwriting it
-    #[arg(long, help_heading = "Download")]
-    pub export_append: bool,
+    /// Workspace/state file (CSV: url,filename,hash,is_dupe), updated live after every file
+    ///
+    /// If the file exists it is loaded first and only ever appended to. URLs already in it
+    /// are skipped and its hashes are used by --nodupes, so re-running an interrupted
+    /// command continues where it stopped. is_dupe=1 means the file had the same content as
+    /// an earlier one and was deleted.
+    #[arg(short = 'L', long, value_name = "FILE.csv", help_heading = "Download")]
+    pub live_csv: Option<PathBuf>,
 
     /// If the file exists, replace it (default: save as "name [1].ext")
-    #[arg(long, help_heading = "Download")]
+    ///
+    /// Only the file NAME is compared: if two different links give different files with
+    /// the same name, --replace will overwrite one with the other.
+    #[arg(short = 'p', long, help_heading = "Download")]
     pub replace: bool,
 
-    /// If the file exists in --dir, skip the URL
-    #[arg(long, help_heading = "Download")]
+    /// Skip a URL if a file with exactly the same NAME already exists in --dir
+    ///
+    /// Only the file name is checked, not the content. If two different links point to
+    /// different files that happen to share a name, --skip (and --replace) can be
+    /// problematic: the second one is skipped/overwritten. Use --nodupes with --live-csv
+    /// to track real content. Add -R to also look in subdirectories.
+    #[arg(short = 's', long, help_heading = "Download")]
     pub skip: bool,
-    /// Like --skip but also search subdirectories
-    #[arg(long, help_heading = "Download")]
-    pub skip_find: bool,
-    /// Skip names listed in *.webgrab_skip files (one per line)
-    #[arg(long, help_heading = "Download")]
-    pub skip_file: bool,
-    /// Ignore extensions when comparing file names
-    #[arg(long, help_heading = "Download")]
-    pub skip_ext: bool,
-    /// Ignore case when comparing file names
-    #[arg(long, help_heading = "Download")]
-    pub skip_case: bool,
-    /// Apply the skip rules before output too (useful with --list / --test)
-    #[arg(long, help_heading = "Download")]
-    pub skip_output: bool,
-    /// --skip-find --skip-file --skip-ext --skip-case --skip-output
-    #[arg(long, help_heading = "Download")]
-    pub skip_all: bool,
 
-    /// Send "User-Agent: webgrab" (fixes some 403 errors)
-    #[arg(long, help_heading = "Download")]
-    pub agent: bool,
-
-    /// Send this User-Agent
-    #[arg(long, value_name = "STRING", help_heading = "Download")]
-    pub user_agent: Option<String>,
+    /// Base URL used to resolve relative links when the input is a local .html file
+    #[arg(short = 'b', long, value_name = "URL", help_heading = "Download")]
+    pub base: Option<String>,
 
     /// Seconds without data before a request is abandoned
     #[arg(long, default_value_t = 60, value_name = "SECS", help_heading = "Download")]
     pub timeout: u64,
 
-    /// Base URL used to resolve relative links when the input is a local .html file
-    #[arg(long, value_name = "URL", help_heading = "Download")]
-    pub base: Option<String>,
+    // ---------------------------------------------------------- user agent
+    /// Send "User-Agent: webgrab"
+    #[arg(long, help_heading = "User-Agent")]
+    pub agent: bool,
+    /// Pretend to be Firefox
+    #[arg(long, help_heading = "User-Agent")]
+    pub agent_firefox: bool,
+    /// Pretend to be Chromium (Linux)
+    #[arg(long, help_heading = "User-Agent")]
+    pub agent_chromium: bool,
+    /// Pretend to be Google Chrome
+    #[arg(long, help_heading = "User-Agent")]
+    pub agent_chrome: bool,
+    /// Pretend to be Brave (Chrome UA + Brave client hints)
+    #[arg(long, help_heading = "User-Agent")]
+    pub agent_brave: bool,
+    /// Send this exact User-Agent (wins over the presets)
+    #[arg(long, value_name = "STRING", help_heading = "User-Agent")]
+    pub user_agent: Option<String>,
 
     // -------------------------------------------------------------- filters
-    /// Keep only links containing one of these (comma separated, repeatable)
-    #[arg(long, value_delimiter = ',', value_name = "KEYWORD", help_heading = "Filters")]
-    pub only: Vec<String>,
+    /// Keep only links containing ANY of these (comma separated, repeatable)
+    #[arg(short = 'a', long, value_delimiter = ',', value_name = "KEYWORD", help_heading = "Filters")]
+    pub any: Vec<String>,
 
     /// Keep only links containing ALL of these
-    #[arg(long, value_delimiter = ',', value_name = "KEYWORD", help_heading = "Filters")]
+    #[arg(short = 'm', long, value_delimiter = ',', value_name = "KEYWORD", help_heading = "Filters")]
     pub must: Vec<String>,
 
     /// Drop links containing any of these
-    #[arg(long, value_delimiter = ',', value_name = "KEYWORD", help_heading = "Filters")]
+    #[arg(short = 'i', long, value_delimiter = ',', value_name = "KEYWORD", help_heading = "Filters")]
     pub ignore: Vec<String>,
 
     /// --video --image --other
-    #[arg(long, help_heading = "Filters")]
+    #[arg(short = 'M', long, help_heading = "Filters")]
     pub media: bool,
     /// Video/audio extensions (.mp4 .webm .mkv .mp3 ...)
     #[arg(long, help_heading = "Filters")]
@@ -157,16 +176,16 @@ pub struct Cli {
     #[arg(long, help_heading = "Display")]
     pub compact: bool,
     /// Don't print errors/warnings (only successful downloads)
-    #[arg(long, help_heading = "Display")]
+    #[arg(short = 'q', long, help_heading = "Display")]
     pub clean: bool,
     /// Number the output
-    #[arg(long, help_heading = "Display")]
+    #[arg(short = 'c', long, help_heading = "Display")]
     pub count: bool,
     /// More detail (--count, DING lines, table output with --list, debug block at the end)
-    #[arg(long, help_heading = "Display")]
+    #[arg(short = 'v', long, help_heading = "Display")]
     pub verbose: bool,
     /// With --list: print only the file names
-    #[arg(long, help_heading = "Display")]
+    #[arg(short = 'f', long, help_heading = "Display")]
     pub filename: bool,
     /// Use colors
     #[arg(long, help_heading = "Display")]
@@ -174,20 +193,10 @@ pub struct Cli {
 }
 
 impl Cli {
-    /// Expand the presets (--grab, --media, --skip-all, ...) into the plain options.
+    /// Expand the presets (--grab, --media, ...) into the plain options.
     pub fn resolve(&mut self) {
-        if self.skip_all {
-            self.skip_find = true;
-            self.skip_file = true;
-            self.skip_case = true;
-            self.skip_ext = true;
-            self.skip_output = true;
-        }
         if self.verbose {
             self.count = true;
-        }
-        if self.hash_existing {
-            self.nodupes = true;
         }
         if self.grab {
             self.clean = true;
@@ -197,7 +206,7 @@ impl Cli {
             self.media = true;
             self.ignore.push("thumb".into());
         }
-        let mut add = |list: &[&str]| self.only.extend(list.iter().map(|s| s.to_string()));
+        let mut add = |list: &[&str]| self.any.extend(list.iter().map(|s| s.to_string()));
         let (media, video, image, other, codec) =
             (self.media, self.video, self.image, self.other, self.codec);
         if media || video {
@@ -212,7 +221,7 @@ impl Cli {
         if codec {
             add(TYPES_CODEC);
         }
-        self.only.retain(|s| !s.is_empty());
+        self.any.retain(|s| !s.is_empty());
         self.must.retain(|s| !s.is_empty());
         self.ignore.retain(|s| !s.is_empty());
         self.threads = self.threads.clamp(1, 256);
@@ -220,7 +229,7 @@ impl Cli {
 }
 
 /// Lets `-flag`, `--flag`, `--flag_name` and `/?` all work.
-/// Single dash + more than one letter is treated as a long flag; real short flags (-t, -h, -V) are untouched.
+/// Single dash + more than one letter is treated as a long flag; real short flags (-t, -R, -h, -V) are untouched.
 pub fn normalized_args() -> Vec<OsString> {
     std::env::args_os()
         .enumerate()

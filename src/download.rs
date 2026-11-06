@@ -1,12 +1,14 @@
 use crate::cli::Cli;
+use crate::csvlog::CsvLog;
 use crate::filter::Filters;
 use crate::skip::Skipper;
 use crate::stats::Stats;
+use crate::ua;
 use crate::ui::{Printer, K};
-use crate::util::{file_name_from_url, human, split_name};
+use crate::util::{file_name_from_url, human, split_name, walk_files};
 use sha2::{Digest, Sha256};
 use std::collections::{HashMap, HashSet};
-use std::fs::{self, File, OpenOptions};
+use std::fs::{self, File};
 use std::io::{self, Read, Write};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::Ordering::Relaxed;
@@ -33,14 +35,15 @@ pub struct Ctx<'a> {
     pub stats: &'a Stats,
     pub filters: Filters,
     pub skipper: Skipper,
-    pub agent: ureq::Agent,
+    agent: ureq::Agent,
+    headers: Vec<(String, String)>,
     pub dir: PathBuf,
     /// file names handed out during this run (so two threads never write the same name)
     reserved: Mutex<HashSet<String>>,
     /// sha256 -> file name of the first file with that content
     hashes: Mutex<HashMap<String, String>>,
-    /// live hash export
-    export: Mutex<Option<File>>,
+    /// --live-csv workspace
+    csv: Option<CsvLog>,
 }
 
 fn hex_of_file(path: &Path) -> io::Result<String> {
@@ -66,29 +69,31 @@ impl<'a> Ctx<'a> {
             fs::create_dir_all(&dir).map_err(|e| format!("can't create {}: {}", dir.display(), e))?;
         }
 
-        let mut ab = ureq::AgentBuilder::new()
+        let agent = ureq::AgentBuilder::new()
             .timeout_connect(Duration::from_secs(15))
-            .timeout_read(Duration::from_secs(cli.timeout.max(1)));
-        if let Some(ua) = &cli.user_agent {
-            ab = ab.user_agent(ua);
-        } else if cli.agent {
-            ab = ab.user_agent("webgrab");
-        }
+            .timeout_read(Duration::from_secs(cli.timeout.max(1)))
+            .build();
 
-        // live hash export
-        let export = match (&cli.export_hashes, downloading) {
-            (Some(p), true) => {
-                let mut oo = OpenOptions::new();
-                oo.create(true).write(true);
-                if cli.export_append {
-                    oo.append(true);
-                } else {
-                    oo.truncate(true);
-                }
-                Some(oo.open(p).map_err(|e| format!("can't open {}: {}", p.display(), e))?)
-            }
+        let csv = match (&cli.live_csv, downloading) {
+            (Some(p), true) => Some(CsvLog::open(p)?),
             _ => None,
         };
+
+        let mut hashes = HashMap::new();
+        if let Some(c) = &csv {
+            for (h, name) in c.loaded_hashes() {
+                hashes.entry(h.clone()).or_insert_with(|| name.clone());
+            }
+            ui.say(
+                K::Inf,
+                &format!(
+                    "loaded {} row(s) from {}{}",
+                    c.loaded_rows,
+                    cli.live_csv.as_ref().unwrap().display(),
+                    if c.bad_rows > 0 { format!(" ({} unreadable row(s) ignored)", c.bad_rows) } else { String::new() }
+                ),
+            );
+        }
 
         let ctx = Ctx {
             cli,
@@ -96,11 +101,12 @@ impl<'a> Ctx<'a> {
             stats,
             filters: Filters::new(cli),
             skipper: Skipper::new(cli, &dir),
-            agent: ab.build(),
+            agent,
+            headers: ua::headers(cli),
             dir,
             reserved: Mutex::new(HashSet::new()),
-            hashes: Mutex::new(HashMap::new()),
-            export: Mutex::new(export),
+            hashes: Mutex::new(hashes),
+            csv,
         };
 
         if cli.hash_existing && downloading {
@@ -109,40 +115,58 @@ impl<'a> Ctx<'a> {
         Ok(ctx)
     }
 
-    /// --hash-existing: remember the hashes of files already in the download directory.
-    fn seed_hashes(&self) {
-        let mut n = 0usize;
-        if let Ok(rd) = fs::read_dir(&self.dir) {
-            let mut map = self.hashes.lock().unwrap_or_else(|e| e.into_inner());
-            for e in rd.flatten() {
-                let p = e.path();
-                let is_file = e.file_type().map(|t| t.is_file()).unwrap_or(false);
-                let name = e.file_name().to_string_lossy().to_string();
-                if !is_file || name.ends_with(".webgrab_download") {
-                    continue;
-                }
-                if let Ok(h) = hex_of_file(&p) {
-                    map.entry(h).or_insert(name);
-                    n += 1;
-                }
-            }
+    /// GET request with the User-Agent / client-hint headers applied.
+    pub fn get(&self, url: &str) -> ureq::Request {
+        let mut r = self.agent.get(url);
+        for (k, v) in &self.headers {
+            r = r.set(k, v);
         }
-        self.ui.say(K::Inf, &format!("hashed {} existing file(s) in {}", n, self.dir.display()));
+        r
     }
 
-    /// Filter rules + skip_output. Updates the counters.
+    /// --hash-existing: hash the files already in --dir (and below with -R).
+    /// Files already recorded in the CSV are not hashed again; new ones are added to it
+    /// with a blank url and is_dupe=0.
+    fn seed_hashes(&self) {
+        let csv_path = self.cli.live_csv.as_ref().and_then(|p| p.canonicalize().ok());
+        let (mut hashed, mut known) = (0usize, 0usize);
+
+        for p in walk_files(&self.dir, self.cli.recursive) {
+            let rel = p.strip_prefix(&self.dir).unwrap_or(&p).to_string_lossy().replace('\\', "/");
+            if rel.ends_with(".webgrab_download") {
+                continue;
+            }
+            if let (Some(c), Ok(me)) = (&csv_path, p.canonicalize()) {
+                if *c == me {
+                    continue; // the workspace file itself
+                }
+            }
+            if let Some(c) = &self.csv {
+                if c.has_loaded_name(&rel) {
+                    known += 1;
+                    continue;
+                }
+            }
+            let Ok(h) = hex_of_file(&p) else { continue };
+            self.hashes.lock().unwrap_or_else(|e| e.into_inner()).entry(h.clone()).or_insert_with(|| rel.clone());
+            if let Some(c) = &self.csv {
+                if let Err(e) = c.write_row("", &rel, &h, false) {
+                    self.note(K::Err, &format!("ERR[live-csv] {}", e));
+                }
+            }
+            hashed += 1;
+        }
+        self.ui.say(
+            K::Inf,
+            &format!("hash-existing: hashed {} file(s), {} already in csv ({})", hashed, known, self.dir.display()),
+        );
+    }
+
+    /// Filter rules. Updates the counters.
     pub fn accept(&self, link: &str) -> bool {
         if !self.filters.passes(link) {
             self.stats.disposed.fetch_add(1, Relaxed);
             return false;
-        }
-        if self.cli.skip_output && self.skipper.active() {
-            if let Some(name) = file_name_from_url(link) {
-                if self.skipper.contains(&name) {
-                    self.stats.skipped.fetch_add(1, Relaxed);
-                    return false;
-                }
-            }
         }
         self.stats.accepted.fetch_add(1, Relaxed);
         true
@@ -152,6 +176,14 @@ impl<'a> Ctx<'a> {
     fn note(&self, k: K, text: &str) {
         if !self.cli.clean {
             self.ui.say(k, text);
+        }
+    }
+
+    fn log_row(&self, url: &str, name: &str, hash: &str, dupe: bool) {
+        if let Some(c) = &self.csv {
+            if let Err(e) = c.write_row(url, name, hash, dupe) {
+                self.note(K::Err, &format!("ERR[live-csv] {}", e));
+            }
         }
     }
 
@@ -225,7 +257,16 @@ impl<'a> Ctx<'a> {
             self.ui.say(K::Cur, &format!("DING[{}]: {} ({})", n, url, name));
         }
 
-        // --skip rules
+        // resume: this URL is already in the --live-csv workspace
+        if let Some(c) = &self.csv {
+            if c.has_url(url) {
+                self.stats.skipped.fetch_add(1, Relaxed);
+                self.note(K::War, &format!("WAR[SKIPPED] {} (already in csv)", url));
+                return Ok(Outcome::Skipped);
+            }
+        }
+
+        // --skip: same file name already exists
         if self.skipper.active() && self.skipper.contains(&name) {
             self.stats.skipped.fetch_add(1, Relaxed);
             self.note(K::War, &format!("WAR[SKIPPED] {} ({})", url, name));
@@ -233,20 +274,16 @@ impl<'a> Ctx<'a> {
         }
 
         let (final_name, clash) = self.reserve(&name);
-        if self.skipper.active() {
-            self.skipper.add(&final_name);
-        }
         let final_path = self.dir.join(&final_name);
         let tmp = self.dir.join(format!("{}.webgrab_download", final_name));
 
-        // request
-        let resp = match self.agent.get(url).call() {
+        let resp = match self.get(url).call() {
             Ok(r) => r,
             Err(ureq::Error::Status(code, _)) => return self.fail(url, &final_name, &format!("HTTP {}", code)),
             Err(e) => return self.fail(url, &final_name, &e.to_string()),
         };
 
-        let want_hash = cli.nodupes || cli.export_hashes.is_some();
+        let want_hash = cli.nodupes || self.csv.is_some();
         let (size, hash) = match self.stream(resp.into_reader(), &tmp, want_hash) {
             Ok(v) => v,
             Err(e) => {
@@ -255,7 +292,7 @@ impl<'a> Ctx<'a> {
             }
         };
 
-        // --nodupes: same content already downloaded -> delete the new file
+        // --nodupes: same content already saved -> delete the new file
         if cli.nodupes {
             if let Some(h) = &hash {
                 let existing = {
@@ -272,6 +309,7 @@ impl<'a> Ctx<'a> {
                     let _ = fs::remove_file(&tmp);
                     self.release(&final_name);
                     self.stats.hash_dupes.fetch_add(1, Relaxed);
+                    self.log_row(url, &final_name, h, true);
                     self.note(K::War, &format!("WAR[DUPLICATE] {} (same content as {}) deleted", url, orig));
                     return Ok(Outcome::HashDupe);
                 }
@@ -284,6 +322,9 @@ impl<'a> Ctx<'a> {
                 self.hashes.lock().unwrap_or_else(|e| e.into_inner()).remove(h);
             }
             return self.fail(url, &final_name, &format!("IO {}", e));
+        }
+        if self.skipper.active() {
+            self.skipper.add(&final_name);
         }
 
         match clash {
@@ -298,16 +339,9 @@ impl<'a> Ctx<'a> {
         let d = self.stats.dled.fetch_add(1, Relaxed) + 1;
         self.stats.bytes.fetch_add(size, Relaxed);
 
-        // live export: written + flushed + synced after every file
+        // live workspace: written + synced after every file
         if let Some(h) = &hash {
-            let mut g = self.export.lock().unwrap_or_else(|e| e.into_inner());
-            if let Some(f) = g.as_mut() {
-                let r = writeln!(f, "{}  {}", h, final_name).and_then(|_| f.flush()).and_then(|_| f.sync_data());
-                if let Err(e) = r {
-                    drop(g);
-                    self.note(K::Err, &format!("ERR[export-hashes] {}", e));
-                }
-            }
+            self.log_row(url, &final_name, h, false);
         }
 
         let tag = match clash {
