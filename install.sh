@@ -1,16 +1,17 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-BINARY="target/release/webgrab"
+APP_NAME="webgrab"
+BINARY="target/release/$APP_NAME"
 INSTALL_DIR="/usr/local/bin"
-INSTALL_PATH="$INSTALL_DIR/webgrab"
+INSTALL_PATH="$INSTALL_DIR/$APP_NAME"
 
 if [[ ! -f "$BINARY" ]]; then
     echo "Error: $BINARY not found. Build the project first."
     exit 1
 fi
 
-echo "Installing webgrab..."
+echo "Installing $APP_NAME..."
 
 sudo install -Dm755 "$BINARY" "$INSTALL_PATH"
 
