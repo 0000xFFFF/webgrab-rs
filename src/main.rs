@@ -377,14 +377,14 @@ fn print_debug(ctx: &Ctx) {
     let bytes = s.bytes.load(Relaxed);
     ui.always(K::Def, "");
     ui.always(K::Top, "===[ DEBUG ]");
-    ui.always(K::Inf, &format!("total/found/all...: {}", g(&s.total)));
-    ui.always(K::Inf, &format!("accepted/valid....: {}", g(&s.accepted)));
-    ui.always(K::Cur, &format!("count/processed...: {}", g(&s.processed)));
-    ui.always(K::Pri, &format!("dled/downloaded...: {} ({} ({} bytes))", g(&s.dled), human(bytes as f64), bytes));
-    ui.always(K::War, &format!("renamed...........: {}", g(&s.renamed)));
-    ui.always(K::War, &format!("replaced..........: {}", g(&s.replaced)));
-    ui.always(K::War, &format!("same hash (deleted): {}", g(&s.hash_dupes)));
-    ui.always(K::War, &format!("skipped/found.....: {}", g(&s.skipped)));
-    ui.always(K::Eri, &format!("disposed/rejected.: {}", g(&s.disposed)));
-    ui.always(K::Eri, &format!("failed............: {}", g(&s.failed)));
+    ui.always(K::Inf, &format!("total/found/all.....: {}", g(&s.total)));
+    ui.always(K::Inf, &format!("accepted/valid......: {}", g(&s.accepted)));
+    ui.always(K::Cur, &format!("count/processed.....: {}", g(&s.processed)));
+    ui.always(K::Pri, &format!("dled/downloaded.....: {} ({} ({} bytes))", g(&s.dled), human(bytes as f64), bytes));
+    ui.always(K::War, &format!("renamed.............: {}", g(&s.renamed)));
+    ui.always(K::War, &format!("replaced............: {}", g(&s.replaced)));
+    ui.always(K::War, &format!("same hash (deleted).: {}", g(&s.hash_dupes)));
+    ui.always(K::War, &format!("skipped/found.......: {}", g(&s.skipped)));
+    ui.always(K::Eri, &format!("disposed/rejected...: {}", g(&s.disposed)));
+    ui.always(K::Eri, &format!("failed..............: {}", g(&s.failed)));
 }
