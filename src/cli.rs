@@ -89,12 +89,14 @@ pub struct Cli {
     #[arg(short = 'H', long, help_heading = "Download")]
     pub hash_existing: bool,
 
-    /// Workspace/state file (CSV: url,filename,hash,is_dupe), updated live after every file
+    /// Workspace/state file (CSV: type,url,name,hash,is_dupe), updated live after every file/page
     ///
-    /// If the file exists it is loaded first and only ever appended to. URLs already in it
-    /// are skipped and its hashes are used by --nodupes, so re-running an interrupted
-    /// command continues where it stopped. is_dupe=1 means the file had the same content as
-    /// an earlier one and was deleted.
+    /// type is media (a downloaded file; name = file name relative to --dir) or page (a crawled
+    /// page; name = its title; hash = sha256 of its HTML). If the file exists it is loaded first
+    /// and only ever appended to. URLs already in it are skipped and its hashes are used by
+    /// --nodupes, so re-running an interrupted command continues where it stopped. is_dupe=1
+    /// means the content was already seen (media: the new file was deleted; page: same HTML as
+    /// an earlier page, not scanned again).
     #[arg(short = 'L', long, value_name = "FILE.csv", help_heading = "Download")]
     pub live_csv: Option<PathBuf>,
 

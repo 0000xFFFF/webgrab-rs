@@ -11,9 +11,10 @@ mod util;
 
 use clap::Parser;
 use cli::Cli;
-use download::Ctx;
+use download::{sha256_hex, Ctx};
+use filter::Hint;
 use stats::Stats;
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::io::Read;
 use std::path::Path;
 use std::process::ExitCode;
@@ -149,18 +150,29 @@ fn page_mode(ctx: &Ctx, input: &str) -> u8 {
 
     if cli.crawl_depth > 0 {
         drop(text);
-        return crawl(ctx, base, html);
+        return crawl(ctx, input, base, html);
     }
 
-    let all = scan::extract(base.as_ref(), &text);
+    let found = scan::extract(base.as_ref(), &text);
     drop(text);
-    stats.total.store(all.len(), Relaxed);
+    stats.total.store(found.len(), Relaxed);
+    // what the HTML elements say (<img>, <video> ...), per URL
+    let mut hints: HashMap<String, Hint> = HashMap::new();
+    let all: Vec<String> = found
+        .into_iter()
+        .map(|f| {
+            if let Some(h) = f.hint {
+                hints.entry(f.url.clone()).or_insert(h);
+            }
+            f.url
+        })
+        .collect();
     let all = unique(ctx, all);
 
     if dl_mode {
         ui.say(K::Inf, &format!("total items ....: {}", stats.total.load(Relaxed)));
     }
-    let links: Vec<String> = all.into_iter().filter(|l| ctx.accept(l)).collect();
+    let links: Vec<String> = all.into_iter().filter(|l| ctx.accept(l, hints.get(l).copied())).collect();
     if dl_mode {
         ui.say(K::Inf, &format!("accepted items..: {}", stats.accepted.load(Relaxed)));
     }
@@ -176,26 +188,37 @@ fn host_key(u: &Url) -> Option<String> {
 
 /// Split one page into (files to download, pages to crawl).
 /// Pages = <a href>/frame links that look like web pages. Files = every other link that
-/// passes the filters. Pages are not downloaded unless --codec is given.
+/// passes the filters; links inside <img>/<video>/<audio>/<source> count as media even
+/// without a file extension. Pages are not downloaded unless --codec is given.
 fn scan_page(ctx: &Ctx, base: Option<&Url>, html: &[u8], seen: &mut HashSet<String>) -> (Vec<String>, Vec<String>) {
     let cli = ctx.cli;
     let text = String::from_utf8_lossy(html);
-    let all = scan::extract(base, &text);
-    let pages = scan::extract_pages(base, &text);
-    ctx.stats.total.fetch_add(all.len(), Relaxed);
+    let found = scan::extract(base, &text);
+    let mut pages = scan::extract_pages(base, &text);
+    ctx.stats.total.fetch_add(found.len(), Relaxed);
 
+    // an element-declared media URL is never a page, even if it is also linked with <a href>
+    let mut hints: HashMap<String, Hint> = HashMap::new();
+    for f in &found {
+        if let Some(h) = f.hint {
+            hints.entry(strip_fragment(&f.url).to_string()).or_insert(h);
+        }
+    }
+    pages.retain(|p| !hints.contains_key(p));
     let page_set: HashSet<&str> = pages.iter().map(|p| p.as_str()).collect();
+
     let mut files = Vec::new();
-    for l in all {
-        let l = strip_fragment(&l).to_string(); // "a.png#x" is the same file as "a.png"
+    for f in found {
+        let l = strip_fragment(&f.url).to_string(); // "a.png#x" is the same file as "a.png"
         if cli.unique && !seen.insert(l.clone()) {
             ctx.stats.disposed.fetch_add(1, Relaxed);
             continue;
         }
-        if !cli.codec && page_set.contains(strip_fragment(&l)) {
+        if !cli.codec && page_set.contains(l.as_str()) {
             continue; // crawlable, not downloadable
         }
-        if ctx.accept(&l) {
+        let hint = hints.get(&l).copied();
+        if ctx.accept(&l, hint) {
             files.push(l);
         }
     }
@@ -311,32 +334,86 @@ fn emit(ctx: &Ctx, files: &[String], collected: &mut Vec<String>, listed: &mut u
     }
 }
 
+struct Crawl {
+    host: Option<String>,
+    visited: HashSet<String>,
+    seen_files: HashSet<String>,
+    collected: Vec<String>,
+    listed: usize,
+}
+
+/// Process one fetched page: hash it, list/download its files, log it in the --live-csv, and
+/// return the pages worth crawling next (empty at the last depth).
+fn handle_page(ctx: &Ctx, st: &mut Crawl, d: usize, url: &str, html: &[u8], base: Option<&Url>) -> Vec<String> {
+    let known = ctx.page_seen(url); // an earlier run already logged it (we only re-read it for its links)
+    let text = String::from_utf8_lossy(html);
+    let title = scan::title(&text);
+    drop(text);
+    let hash = ctx.tracks_pages().then(|| sha256_hex(html));
+
+    // same content as a page we already crawled under another URL: nothing new in it
+    if !known {
+        if let Some(h) = &hash {
+            if let Some(owner) = ctx.page_hash_owner(h) {
+                if owner != url {
+                    ctx.stats.page_dupes.fetch_add(1, Relaxed);
+                    ctx.log_page(url, &title, h, true);
+                    if !ctx.cli.clean {
+                        ctx.ui.say(K::War, &format!("WAR[DUPLICATE PAGE] {} (same content as {})", url, owner));
+                    }
+                    return Vec::new();
+                }
+            }
+        }
+    }
+
+    let (files, pages) = scan_page(ctx, base, html, &mut st.seen_files);
+    emit(ctx, &files, &mut st.collected, &mut st.listed);
+    // logged only after its files are done, so an interrupted page is read again next time
+    if !known {
+        if let Some(h) = &hash {
+            ctx.log_page(url, &title, h, false);
+        }
+    }
+    ctx.stats.pages.fetch_add(1, Relaxed);
+
+    if d < ctx.cli.crawl_depth {
+        follow_pages(ctx, pages, &st.host, &mut st.visited)
+    } else {
+        Vec::new()
+    }
+}
+
 /// --crawl-depth N: breadth-first crawl. Files of every page are downloaded (or listed) as soon as
 /// the page has been scanned, so an interrupted run (with --live-csv) can be resumed.
-fn crawl(ctx: &Ctx, start_base: Option<Url>, start_html: Vec<u8>) -> u8 {
+///
+/// With --live-csv every crawled page is logged (type=page). On a re-run:
+///  - pages at the last depth that are in the CSV are skipped (nothing to find in them),
+///  - pages above it are read again, only to find the pages below them (their files are skipped
+///    because they are in the CSV too) - otherwise an interrupted crawl could never continue.
+fn crawl(ctx: &Ctx, input: &str, start_base: Option<Url>, start_html: Vec<u8>) -> u8 {
     let (cli, ui, stats) = (ctx.cli, ctx.ui, ctx.stats);
     let max = cli.crawl_depth;
-    let host = start_base.as_ref().and_then(host_key);
 
-    let mut visited: HashSet<String> = HashSet::new();
-    if let Some(b) = &start_base {
-        visited.insert(strip_fragment(b.as_str()).to_string());
-    }
-    let mut seen_files: HashSet<String> = HashSet::new();
-    let mut collected: Vec<String> = Vec::new();
-    let mut listed = 0usize;
+    let start_key = strip_fragment(start_base.as_ref().map(|u| u.as_str()).unwrap_or(input)).to_string();
+    let mut st = Crawl {
+        host: start_base.as_ref().and_then(host_key),
+        visited: HashSet::new(),
+        seen_files: HashSet::new(),
+        collected: Vec::new(),
+        listed: 0,
+    };
+    st.visited.insert(start_key.clone());
 
-    // depth 0: the page we already have
-    let label = start_base.as_ref().map(|u| u.as_str().to_string()).unwrap_or_else(|| "(local file)".into());
-    crawl_log(ctx, &format!("===[ CRAWL depth 0/{} ]: {}", max, label));
-    let (files, pages) = scan_page(ctx, start_base.as_ref(), &start_html, &mut seen_files);
-    drop(start_html);
-    emit(ctx, &files, &mut collected, &mut listed);
-    if start_base.is_none() && !pages.is_empty() {
+    if start_base.is_none() {
         let k = if cli.list || cli.test { K::Err } else { K::War };
         ui.say(k, "WAR[--crawl-depth] local file without --base: relative links can't be followed");
     }
-    let mut level = follow_pages(ctx, pages, &host, &mut visited);
+
+    // depth 0: the page we already have
+    crawl_log(ctx, &format!("===[ CRAWL depth 0/{} ]: {}", max, start_key));
+    let mut level = handle_page(ctx, &mut st, 0, &start_key, &start_html, start_base.as_ref());
+    drop(start_html);
 
     for d in 1..=max {
         if level.is_empty() {
@@ -345,6 +422,13 @@ fn crawl(ctx: &Ctx, start_base: Option<Url>, start_html: Vec<u8>) -> u8 {
         let mut next: Vec<String> = Vec::new();
         let n = level.len();
         for (i, page) in level.iter().enumerate() {
+            if d == max && ctx.page_seen(page) {
+                stats.skipped.fetch_add(1, Relaxed);
+                if !cli.clean {
+                    ui.say(K::War, &format!("WAR[SKIPPED] {} (page already in csv)", page));
+                }
+                continue;
+            }
             crawl_log(ctx, &format!("===[ CRAWL depth {}/{} page {}/{} ]: {}", d, max, i + 1, n, page));
             match fetch_page(ctx, page) {
                 Ok(Some((html, base))) => {
@@ -352,15 +436,11 @@ fn crawl(ctx: &Ctx, start_base: Option<Url>, start_html: Vec<u8>) -> u8 {
                     if let Some(b) = &base {
                         // redirected to a page we've already seen
                         let fin = strip_fragment(b.as_str());
-                        if fin != page.as_str() && !visited.insert(fin.to_string()) {
+                        if fin != page.as_str() && !st.visited.insert(fin.to_string()) {
                             continue;
                         }
                     }
-                    let (files, pages) = scan_page(ctx, base.as_ref(), &html, &mut seen_files);
-                    emit(ctx, &files, &mut collected, &mut listed);
-                    if d < max {
-                        next.extend(follow_pages(ctx, pages, &host, &mut visited));
-                    }
+                    next.extend(handle_page(ctx, &mut st, d, page, &html, base.as_ref()));
                 }
                 Ok(None) => {
                     if cli.verbose {
@@ -382,7 +462,7 @@ fn crawl(ctx: &Ctx, start_base: Option<Url>, start_html: Vec<u8>) -> u8 {
 
     if cli.list {
         if cli.verbose {
-            print_list(ctx, &collected, 0);
+            print_list(ctx, &st.collected, 0);
         }
         0
     } else if cli.test {
@@ -421,7 +501,7 @@ fn read_mode(ctx: &Ctx, path: &Path) -> u8 {
         ui.say(K::Inf, &format!("total items....: {}", lines.len()));
     }
     let lines = unique(ctx, lines);
-    let links: Vec<String> = lines.into_iter().filter(|l| ctx.accept(l)).collect();
+    let links: Vec<String> = lines.into_iter().filter(|l| ctx.accept(l, None)).collect();
     if !cli.list && !cli.test {
         ui.say(K::Inf, &format!("accepted items.: {}", links.len()));
     }
@@ -464,7 +544,7 @@ fn watch(ctx: &Ctx) -> u8 {
             ctx.stats.disposed.fetch_add(1, Relaxed);
             continue;
         }
-        if ctx.accept(clip) {
+        if ctx.accept(clip, None) {
             let _ = ctx.download(clip);
         }
     }
@@ -607,6 +687,8 @@ fn compact_line(s: &Stats) -> String {
     add("renamed", g(&s.renamed));
     add("replc", g(&s.replaced));
     add("hdupe", g(&s.hash_dupes));
+    add("pages", g(&s.pages));
+    add("pdupe", g(&s.page_dupes));
     add("skip", g(&s.skipped));
     add("junk", g(&s.disposed));
     add("fail", g(&s.failed));
@@ -627,6 +709,9 @@ fn print_debug(ctx: &Ctx) {
     ui.always(K::War, &format!("replaced............: {}", g(&s.replaced)));
     ui.always(K::War, &format!("same hash (deleted).: {}", g(&s.hash_dupes)));
     ui.always(K::War, &format!("skipped/found.......: {}", g(&s.skipped)));
+    if g(&s.pages) > 0 {
+        ui.always(K::Cur, &format!("pages crawled.......: {} ({} duplicate)", g(&s.pages), g(&s.page_dupes)));
+    }
     ui.always(K::Eri, &format!("disposed/rejected...: {}", g(&s.disposed)));
     ui.always(K::Eri, &format!("failed..............: {}", g(&s.failed)));
 }

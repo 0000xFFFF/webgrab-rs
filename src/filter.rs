@@ -49,6 +49,14 @@ pub fn is_http(link: &str) -> bool {
         .unwrap_or(false)
 }
 
+/// What the HTML element around a link says it is (`<img>` -> Image, `<video>`/`<audio>` -> Video).
+/// Lets --image/--video/--media accept links that have no file extension.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum Hint {
+    Image,
+    Video,
+}
+
 /// Keyword rules, case-insensitive substring matching (same semantics as the C# version):
 ///   any    = at least one must be present
 ///   must   = all must be present
@@ -58,12 +66,21 @@ pub struct Filters {
     must: Vec<String>,
     ignore: Vec<String>,
     valid: bool,
+    hint_image: bool,
+    hint_video: bool,
 }
 
 impl Filters {
     pub fn new(cli: &Cli) -> Self {
         let lc = |v: &Vec<String>| v.iter().map(|s| s.to_lowercase()).collect::<Vec<_>>();
-        Self { only: lc(&cli.any), must: lc(&cli.must), ignore: lc(&cli.ignore), valid: cli.valid }
+        Self {
+            only: lc(&cli.any),
+            must: lc(&cli.must),
+            ignore: lc(&cli.ignore),
+            valid: cli.valid,
+            hint_image: cli.media || cli.image,
+            hint_video: cli.media || cli.video,
+        }
     }
 
     /// --ignore keywords only (also applied to links the crawler would follow).
@@ -72,7 +89,7 @@ impl Filters {
         self.ignore.iter().any(|k| l.contains(k.as_str()))
     }
 
-    pub fn passes(&self, link: &str) -> bool {
+    pub fn passes(&self, link: &str, hint: Option<Hint>) -> bool {
         if link.is_empty() {
             return false;
         }
@@ -81,7 +98,15 @@ impl Filters {
         }
         let l = link.to_lowercase();
         if !self.only.is_empty() && !self.only.iter().any(|k| l.contains(k.as_str())) {
-            return false;
+            // no extension/keyword match: still accepted if the element says it's wanted media
+            let by_hint = match hint {
+                Some(Hint::Image) => self.hint_image,
+                Some(Hint::Video) => self.hint_video,
+                None => false,
+            };
+            if !by_hint {
+                return false;
+            }
         }
         if !self.must.iter().all(|k| l.contains(k.as_str())) {
             return false;

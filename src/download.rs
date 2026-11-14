@@ -1,6 +1,7 @@
 use crate::cli::Cli;
 use crate::csvlog::CsvLog;
-use crate::filter::Filters;
+use crate::csvlog::{MEDIA, PAGE};
+use crate::filter::{Filters, Hint};
 use crate::skip::Skipper;
 use crate::stats::Stats;
 use crate::ua;
@@ -60,6 +61,40 @@ fn hex_of_file(path: &Path) -> io::Result<String> {
     Ok(format!("{:x}", h.finalize()))
 }
 
+pub fn sha256_hex(data: &[u8]) -> String {
+    format!("{:x}", Sha256::digest(data))
+}
+
+/// File extension for a response Content-Type (used when the URL has none).
+fn ext_for_mime(ct: &str) -> Option<&'static str> {
+    let m = ct.split(';').next().unwrap_or("").trim().to_lowercase();
+    Some(match m.as_str() {
+        "image/jpeg" | "image/jpg" | "image/pjpeg" => ".jpg",
+        "image/png" => ".png",
+        "image/gif" => ".gif",
+        "image/webp" => ".webp",
+        "image/avif" => ".avif",
+        "image/svg+xml" => ".svg",
+        "image/bmp" => ".bmp",
+        "image/tiff" => ".tif",
+        "image/x-icon" | "image/vnd.microsoft.icon" => ".ico",
+        "video/mp4" => ".mp4",
+        "video/webm" => ".webm",
+        "video/quicktime" => ".mov",
+        "video/x-matroska" => ".mkv",
+        "video/mpeg" => ".mpg",
+        "video/x-flv" => ".flv",
+        "video/ogg" => ".ogv",
+        "video/x-msvideo" => ".avi",
+        "audio/mpeg" | "audio/mp3" => ".mp3",
+        "audio/ogg" => ".ogg",
+        "audio/wav" | "audio/x-wav" => ".wav",
+        "audio/webm" => ".weba",
+        "audio/aac" | "audio/mp4" | "audio/x-m4a" => ".m4a",
+        _ => return None,
+    })
+}
+
 impl<'a> Ctx<'a> {
     pub fn new(cli: &'a Cli, ui: &'a Printer, stats: &'a Stats) -> Result<Self, String> {
         let dir = cli.dir.clone().unwrap_or_else(|| PathBuf::from("."));
@@ -83,6 +118,9 @@ impl<'a> Ctx<'a> {
         if let Some(c) = &csv {
             for (h, name) in c.loaded_hashes() {
                 hashes.entry(h.clone()).or_insert_with(|| name.clone());
+            }
+            if c.migrated {
+                ui.say(K::War, "WAR[live-csv] old 4-column csv converted to type,url,name,hash,is_dupe (copy kept as .legacy.bak)");
             }
             ui.say(
                 K::Inf,
@@ -150,7 +188,7 @@ impl<'a> Ctx<'a> {
             let Ok(h) = hex_of_file(&p) else { continue };
             self.hashes.lock().unwrap_or_else(|e| e.into_inner()).entry(h.clone()).or_insert_with(|| rel.clone());
             if let Some(c) = &self.csv {
-                if let Err(e) = c.write_row("", &rel, &h, false) {
+                if let Err(e) = c.write_row(MEDIA, "", &rel, &h, false) {
                     self.note(K::Err, &format!("ERR[live-csv] {}", e));
                 }
             }
@@ -163,8 +201,8 @@ impl<'a> Ctx<'a> {
     }
 
     /// Filter rules. Updates the counters.
-    pub fn accept(&self, link: &str) -> bool {
-        if !self.filters.passes(link) {
+    pub fn accept(&self, link: &str, hint: Option<Hint>) -> bool {
+        if !self.filters.passes(link, hint) {
             self.stats.disposed.fetch_add(1, Relaxed);
             return false;
         }
@@ -181,9 +219,41 @@ impl<'a> Ctx<'a> {
 
     fn log_row(&self, url: &str, name: &str, hash: &str, dupe: bool) {
         if let Some(c) = &self.csv {
-            if let Err(e) = c.write_row(url, name, hash, dupe) {
+            if let Err(e) = c.write_row(MEDIA, url, name, hash, dupe) {
                 self.note(K::Err, &format!("ERR[live-csv] {}", e));
             }
+        }
+    }
+
+    // ---- crawled pages in the --live-csv workspace
+
+    /// Is the page already in the CSV?
+    pub fn page_seen(&self, url: &str) -> bool {
+        self.csv.as_ref().map_or(false, |c| c.has_page(url))
+    }
+
+    /// Is the CSV hashing pages?
+    pub fn tracks_pages(&self) -> bool {
+        self.csv.is_some()
+    }
+
+    /// URL of an earlier page with exactly this content.
+    pub fn page_hash_owner(&self, hash: &str) -> Option<String> {
+        self.csv.as_ref().and_then(|c| c.page_hash_owner(hash))
+    }
+
+    /// Add a crawled page: name = its title (or the last part of its URL if it has none).
+    pub fn log_page(&self, url: &str, title: &str, hash: &str, dupe: bool) {
+        let Some(c) = &self.csv else { return };
+        let name = if !title.is_empty() {
+            title.to_string()
+        } else {
+            file_name_from_url(url)
+                .or_else(|| url::Url::parse(url).ok().and_then(|u| u.host_str().map(String::from)))
+                .unwrap_or_else(|| url.to_string())
+        };
+        if let Err(e) = c.write_row(PAGE, url, &name, hash, dupe) {
+            self.note(K::Err, &format!("ERR[live-csv] {}", e));
         }
     }
 
@@ -219,8 +289,10 @@ impl<'a> Ctx<'a> {
         self.reserved.lock().unwrap_or_else(|e| e.into_inner()).remove(name);
     }
 
-    fn fail(&self, url: &str, name: &str, msg: &str) -> Result<Outcome, String> {
-        self.release(name);
+    fn fail(&self, url: &str, name: Option<&str>, msg: &str) -> Result<Outcome, String> {
+        if let Some(n) = name {
+            self.release(n);
+        }
         self.stats.failed.fetch_add(1, Relaxed);
         self.note(K::Err, &format!("ERR[{}] {}", msg, url));
         Err(msg.to_string())
@@ -259,7 +331,7 @@ impl<'a> Ctx<'a> {
 
         // resume: this URL is already in the --live-csv workspace
         if let Some(c) = &self.csv {
-            if c.has_url(url) {
+            if c.has_media_url(url) {
                 self.stats.skipped.fetch_add(1, Relaxed);
                 self.note(K::War, &format!("WAR[SKIPPED] {} (already in csv)", url));
                 return Ok(Outcome::Skipped);
@@ -273,22 +345,28 @@ impl<'a> Ctx<'a> {
             return Ok(Outcome::Skipped);
         }
 
+        let resp = match self.get(url).call() {
+            Ok(r) => r,
+            Err(ureq::Error::Status(code, _)) => return self.fail(url, None, &format!("HTTP {}", code)),
+            Err(e) => return self.fail(url, None, &e.to_string()),
+        };
+
+        // URL without an extension (".../image?id=5"): take it from the Content-Type
+        let name = match resp.header("content-type").and_then(ext_for_mime) {
+            Some(ext) if split_name(&name).1.is_empty() => format!("{}{}", name, ext),
+            _ => name,
+        };
+
         let (final_name, clash) = self.reserve(&name);
         let final_path = self.dir.join(&final_name);
         let tmp = self.dir.join(format!("{}.webgrab_download", final_name));
-
-        let resp = match self.get(url).call() {
-            Ok(r) => r,
-            Err(ureq::Error::Status(code, _)) => return self.fail(url, &final_name, &format!("HTTP {}", code)),
-            Err(e) => return self.fail(url, &final_name, &e.to_string()),
-        };
 
         let want_hash = cli.nodupes || self.csv.is_some();
         let (size, hash) = match self.stream(resp.into_reader(), &tmp, want_hash) {
             Ok(v) => v,
             Err(e) => {
                 let _ = fs::remove_file(&tmp);
-                return self.fail(url, &final_name, &format!("IO {}", e));
+                return self.fail(url, Some(&final_name), &format!("IO {}", e));
             }
         };
 
@@ -321,7 +399,7 @@ impl<'a> Ctx<'a> {
             if let (true, Some(h)) = (cli.nodupes, &hash) {
                 self.hashes.lock().unwrap_or_else(|e| e.into_inner()).remove(h);
             }
-            return self.fail(url, &final_name, &format!("IO {}", e));
+            return self.fail(url, Some(&final_name), &format!("IO {}", e));
         }
         if self.skipper.active() {
             self.skipper.add(&final_name);
