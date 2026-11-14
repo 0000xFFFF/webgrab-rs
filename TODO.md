@@ -2,3 +2,4 @@
 - add color by default the switch --color option with --nocolor
 - add counting by default
 - move away from --live-csv and replace the option with --db sqlite.db save relationships to sqlite database
+- ditch the --grab option make better flag shortcuts
