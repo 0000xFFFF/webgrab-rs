@@ -22,7 +22,7 @@ use std::sync::atomic::{AtomicBool, AtomicUsize};
 use std::time::Duration;
 use ui::{Printer, K};
 use url::Url;
-use util::{file_name_from_url, human, url_ext};
+use util::{file_name_from_url, human, strip_fragment, url_ext};
 
 fn main() -> ExitCode {
     #[cfg(windows)]
@@ -147,6 +147,11 @@ fn page_mode(ctx: &Ctx, input: &str) -> u8 {
         ui.say(K::Inf, &format!("title from html.: {}", title));
     }
 
+    if cli.depth > 0 {
+        drop(text);
+        return crawl(ctx, base, html);
+    }
+
     let all = scan::extract(base.as_ref(), &text);
     drop(text);
     stats.total.store(all.len(), Relaxed);
@@ -163,6 +168,187 @@ fn page_mode(ctx: &Ctx, input: &str) -> u8 {
     finish(ctx, links)
 }
 
+// ------------------------------------------------------------------ crawl (--depth)
+
+fn host_key(u: &Url) -> Option<String> {
+    u.host_str().map(|h| h.trim_start_matches("www.").to_lowercase())
+}
+
+/// Split one page into (files to download, pages to crawl).
+/// Pages = <a href>/frame links that look like web pages. Files = every other link that
+/// passes the filters. Pages are not downloaded unless --codec is given.
+fn scan_page(ctx: &Ctx, base: Option<&Url>, html: &[u8], seen: &mut HashSet<String>) -> (Vec<String>, Vec<String>) {
+    let cli = ctx.cli;
+    let text = String::from_utf8_lossy(html);
+    let all = scan::extract(base, &text);
+    let pages = scan::extract_pages(base, &text);
+    ctx.stats.total.fetch_add(all.len(), Relaxed);
+
+    let page_set: HashSet<&str> = pages.iter().map(|p| p.as_str()).collect();
+    let mut files = Vec::new();
+    for l in all {
+        let l = strip_fragment(&l).to_string(); // "a.png#x" is the same file as "a.png"
+        if cli.unique && !seen.insert(l.clone()) {
+            ctx.stats.disposed.fetch_add(1, Relaxed);
+            continue;
+        }
+        if !cli.codec && page_set.contains(strip_fragment(&l)) {
+            continue; // crawlable, not downloadable
+        }
+        if ctx.accept(&l) {
+            files.push(l);
+        }
+    }
+    (files, pages)
+}
+
+/// Pages from `pages` that should be crawled next: same host (unless --external),
+/// not --ignore'd, never visited before. Marks them visited.
+fn follow_pages(ctx: &Ctx, pages: Vec<String>, host: &Option<String>, visited: &mut HashSet<String>) -> Vec<String> {
+    let mut out = Vec::new();
+    for p in pages {
+        if ctx.filters.ignored(&p) {
+            continue;
+        }
+        let Ok(u) = Url::parse(&p) else { continue };
+        if !ctx.cli.external && host_key(&u) != *host {
+            continue;
+        }
+        if visited.insert(p.clone()) {
+            out.push(p);
+        }
+    }
+    out
+}
+
+/// Ok(None) = the response is not HTML (not crawled).
+fn fetch_page(ctx: &Ctx, url: &str) -> Result<Option<(Vec<u8>, Option<Url>)>, String> {
+    let resp = match ctx.get(url).call() {
+        Ok(r) => r,
+        Err(ureq::Error::Status(code, _)) => return Err(format!("HTTP {}", code)),
+        Err(e) => return Err(e.to_string()),
+    };
+    if let Some(ct) = resp.header("content-type") {
+        if !ct.to_lowercase().contains("html") {
+            return Ok(None);
+        }
+    }
+    let base = Url::parse(resp.get_url()).ok(); // after redirects
+    let mut buf = Vec::new();
+    resp.into_reader().take(32 << 20).read_to_end(&mut buf).map_err(|e| e.to_string())?;
+    Ok(Some((buf, base)))
+}
+
+/// Progress lines. In --list/--test mode they go to stderr so stdout stays a clean link list.
+fn crawl_log(ctx: &Ctx, text: &str) {
+    if ctx.cli.list || ctx.cli.test {
+        if !ctx.cli.clean {
+            ctx.ui.say(K::Err, text);
+        }
+    } else {
+        ctx.ui.say(K::Def, "");
+        ctx.ui.say(K::Top, text);
+    }
+}
+
+/// List or download one page's files.
+fn emit(ctx: &Ctx, files: &[String], collected: &mut Vec<String>, listed: &mut usize) {
+    let cli = ctx.cli;
+    if cli.list {
+        if cli.verbose {
+            collected.extend_from_slice(files); // table is printed once, at the end
+        } else {
+            print_list(ctx, files, *listed);
+            *listed += files.len();
+        }
+    } else if !cli.test && !files.is_empty() {
+        run_downloads(ctx, files);
+    }
+}
+
+/// --depth N: breadth-first crawl. Files of every page are downloaded (or listed) as soon as
+/// the page has been scanned, so an interrupted run (with --live-csv) can be resumed.
+fn crawl(ctx: &Ctx, start_base: Option<Url>, start_html: Vec<u8>) -> u8 {
+    let (cli, ui, stats) = (ctx.cli, ctx.ui, ctx.stats);
+    let max = cli.depth;
+    let host = start_base.as_ref().and_then(host_key);
+
+    let mut visited: HashSet<String> = HashSet::new();
+    if let Some(b) = &start_base {
+        visited.insert(strip_fragment(b.as_str()).to_string());
+    }
+    let mut seen_files: HashSet<String> = HashSet::new();
+    let mut collected: Vec<String> = Vec::new();
+    let mut listed = 0usize;
+
+    // depth 0: the page we already have
+    let label = start_base.as_ref().map(|u| u.as_str().to_string()).unwrap_or_else(|| "(local file)".into());
+    crawl_log(ctx, &format!("===[ CRAWL depth 0/{} ]: {}", max, label));
+    let (files, pages) = scan_page(ctx, start_base.as_ref(), &start_html, &mut seen_files);
+    drop(start_html);
+    emit(ctx, &files, &mut collected, &mut listed);
+    if start_base.is_none() && !pages.is_empty() {
+        let k = if cli.list || cli.test { K::Err } else { K::War };
+        ui.say(k, "WAR[--depth] local file without --base: relative links can't be followed");
+    }
+    let mut level = follow_pages(ctx, pages, &host, &mut visited);
+
+    for d in 1..=max {
+        if level.is_empty() {
+            break;
+        }
+        let mut next: Vec<String> = Vec::new();
+        let n = level.len();
+        for (i, page) in level.iter().enumerate() {
+            crawl_log(ctx, &format!("===[ CRAWL depth {}/{} page {}/{} ]: {}", d, max, i + 1, n, page));
+            match fetch_page(ctx, page) {
+                Ok(Some((html, base))) => {
+                    let base = base.or_else(|| Url::parse(page).ok());
+                    if let Some(b) = &base {
+                        // redirected to a page we've already seen
+                        let fin = strip_fragment(b.as_str());
+                        if fin != page.as_str() && !visited.insert(fin.to_string()) {
+                            continue;
+                        }
+                    }
+                    let (files, pages) = scan_page(ctx, base.as_ref(), &html, &mut seen_files);
+                    emit(ctx, &files, &mut collected, &mut listed);
+                    if d < max {
+                        next.extend(follow_pages(ctx, pages, &host, &mut visited));
+                    }
+                }
+                Ok(None) => {
+                    if cli.verbose {
+                        // stderr in --list/--test so stdout stays a clean link list
+                        let k = if cli.list || cli.test { K::Err } else { K::War };
+                        ui.say(k, &format!("WAR[NOT HTML] {}", page));
+                    }
+                }
+                Err(e) => {
+                    stats.failed.fetch_add(1, Relaxed);
+                    if !cli.clean {
+                        ui.say(K::Err, &format!("ERR[{}] {}", e, page));
+                    }
+                }
+            }
+        }
+        level = next;
+    }
+
+    if cli.list {
+        if cli.verbose {
+            print_list(ctx, &collected, 0);
+        }
+        0
+    } else if cli.test {
+        print_test_counts(ctx);
+        0
+    } else {
+        ui.say(K::Def, "");
+        download_summary(ctx)
+    }
+}
+
 // ------------------------------------------------------------- --read file
 
 fn read_mode(ctx: &Ctx, path: &Path) -> u8 {
@@ -174,6 +360,9 @@ fn read_mode(ctx: &Ctx, path: &Path) -> u8 {
             return 1;
         }
     };
+    if cli.depth > 0 {
+        ui.say(K::War, "WAR[--depth] is ignored with --read (every line is downloaded as a file)");
+    }
     ui.say(K::Def, "");
     ui.say(K::Top, "===[ SCANNING TEXT FILE ]");
     let lines: Vec<String> = text
@@ -258,21 +447,26 @@ fn unique(ctx: &Ctx, items: Vec<String>) -> Vec<String> {
 
 fn finish(ctx: &Ctx, links: Vec<String>) -> u8 {
     if ctx.cli.list {
-        print_list(ctx, &links);
+        print_list(ctx, &links, 0);
         0
     } else if ctx.cli.test {
-        let s = ctx.stats;
-        ctx.ui.always(K::Inf, &format!("total items.......: {}", s.total.load(Relaxed)));
-        ctx.ui.always(K::Inf, &format!("accepted items....: {}", s.accepted.load(Relaxed)));
-        ctx.ui.always(K::War, &format!("skipped/found.....: {}", s.skipped.load(Relaxed)));
-        ctx.ui.always(K::Eri, &format!("disposed/rejected.: {}", s.disposed.load(Relaxed)));
+        print_test_counts(ctx);
         0
     } else {
         finish_downloads(ctx, &links)
     }
 }
 
-fn print_list(ctx: &Ctx, links: &[String]) {
+fn print_test_counts(ctx: &Ctx) {
+    let s = ctx.stats;
+    ctx.ui.always(K::Inf, &format!("total items.......: {}", s.total.load(Relaxed)));
+    ctx.ui.always(K::Inf, &format!("accepted items....: {}", s.accepted.load(Relaxed)));
+    ctx.ui.always(K::War, &format!("skipped/found.....: {}", s.skipped.load(Relaxed)));
+    ctx.ui.always(K::Eri, &format!("disposed/rejected.: {}", s.disposed.load(Relaxed)));
+}
+
+/// `start` = how many links were already printed (keeps --count numbering going across pages).
+fn print_list(ctx: &Ctx, links: &[String], start: usize) {
     let cli = ctx.cli;
     let ui = ctx.ui;
     if cli.verbose {
@@ -293,7 +487,7 @@ fn print_list(ctx: &Ctx, links: &[String]) {
         }
     } else if cli.count {
         for (i, l) in links.iter().enumerate() {
-            ui.plain(&format!("[{}] {}", i + 1, l));
+            ui.plain(&format!("[{}] {}", start + i + 1, l));
         }
     } else {
         for l in links {
@@ -306,7 +500,10 @@ fn finish_downloads(ctx: &Ctx, urls: &[String]) -> u8 {
     ctx.ui.say(K::Def, "");
     ctx.ui.say(K::Top, "===[ DOWNLOADING ]");
     run_downloads(ctx, urls);
+    download_summary(ctx)
+}
 
+fn download_summary(ctx: &Ctx) -> u8 {
     if ctx.cli.compact {
         ctx.ui.ticker(&compact_line(ctx.stats));
         ctx.ui.always(K::Def, "");

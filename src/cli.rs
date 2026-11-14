@@ -19,6 +19,8 @@ SKIP / DUPLICATE RULES (what each one checks):
 EXAMPLES:
   webgrab https://example.com/gallery --grab --threads 8
   webgrab https://example.com/gallery --list --image --unique
+  webgrab https://example.com/gallery --depth 2 --image --unique -t 8 -d pics
+  webgrab https://example.com/gallery --depth 1 --list --media --unique
   webgrab page.html --list --base https://example.com/ --video
   webgrab --live-csv data.csv --nodupes --unique download_links.html
   webgrab --read urls.txt --media -t 4 -d downloads --live-csv log.csv --hash-existing -R
@@ -114,6 +116,20 @@ pub struct Cli {
     /// Base URL used to resolve relative links when the input is a local .html file
     #[arg(short = 'b', long, value_name = "URL", help_heading = "Download")]
     pub base: Option<String>,
+
+    /// How deep to crawl: 0 = only the given page, 1 = also the pages it links to, 2 = and theirs ...
+    ///
+    /// Links are split into pages (crawled: <a href>, frames) and files (downloaded: everything
+    /// else that passes your filters). Pages are followed only on the same host unless
+    /// --external is given, each page once. Use --unique so a file shown on many pages is
+    /// downloaded once. --ignore also applies to pages (e.g. --ignore logout). Pages are not
+    /// saved unless you add --codec. Applies to a page URL / .html file, not to --read.
+    #[arg(short = 'D', long, default_value_t = 0, value_name = "NUM", help_heading = "Download")]
+    pub depth: usize,
+
+    /// With --depth: also follow links to other hosts (default: stay on the start page's host)
+    #[arg(long, help_heading = "Download")]
+    pub external: bool,
 
     /// Seconds without data before a request is abandoned
     #[arg(long, default_value_t = 60, value_name = "SECS", help_heading = "Download")]

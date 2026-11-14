@@ -14,6 +14,18 @@ fn re_css() -> &'static Regex {
     static R: OnceLock<Regex> = OnceLock::new();
     R.get_or_init(|| Regex::new(r#"(?i)url\(\s*['"]?([^'")\s]+)['"]?\s*\)"#).unwrap())
 }
+fn re_href() -> &'static Regex {
+    static R: OnceLock<Regex> = OnceLock::new();
+    R.get_or_init(|| {
+        Regex::new(r#"(?i)<(?:a|area)\b[^>]*?\bhref\s*=\s*(?:"([^"]*)"|'([^']*)'|([^\s"'>]+))"#).unwrap()
+    })
+}
+fn re_frame() -> &'static Regex {
+    static R: OnceLock<Regex> = OnceLock::new();
+    R.get_or_init(|| {
+        Regex::new(r#"(?i)<(?:iframe|frame)\b[^>]*?\bsrc\s*=\s*(?:"([^"]*)"|'([^']*)'|([^\s"'>]+))"#).unwrap()
+    })
+}
 fn re_comma_ws() -> &'static Regex {
     static R: OnceLock<Regex> = OnceLock::new();
     R.get_or_init(|| Regex::new(r",\s+").unwrap())
@@ -118,4 +130,36 @@ fn resolve(base: Option<&Url>, s: &str) -> Option<String> {
         Some(b) => b.join(s).ok().map(|u| u.to_string()),
         None => Some(s.to_string()), // local file without --base: keep as written
     }
+}
+
+/// Links the crawler may follow: `<a href>`, `<area href>`, `<iframe src>`, `<frame src>`,
+/// resolved against `base`, fragments removed, only things that look like web pages.
+/// (Everything else found by `extract` is a download candidate.)
+pub fn extract_pages(base: Option<&Url>, html: &str) -> Vec<String> {
+    let mut found: Vec<(usize, String)> = Vec::new();
+    for re in [re_href(), re_frame()] {
+        for c in re.captures_iter(html) {
+            let m = c.get(1).or_else(|| c.get(2)).or_else(|| c.get(3));
+            if let Some(m) = m {
+                found.push((m.start(), m.as_str().to_string()));
+            }
+        }
+    }
+    found.sort_by_key(|(pos, _)| *pos);
+
+    let mut seen = std::collections::HashSet::new();
+    let mut out = Vec::new();
+    for (_, raw) in found {
+        let dec = html_escape::decode_html_entities(&raw).to_string();
+        let s = dec.trim();
+        if s.is_empty() || s.starts_with('#') || s.len() > 2048 {
+            continue;
+        }
+        let Some(u) = resolve(base, s) else { continue };
+        let u = crate::util::strip_fragment(&u).to_string();
+        if crate::filter::is_page_link(&u) && seen.insert(u.clone()) {
+            out.push(u);
+        }
+    }
+    out
 }

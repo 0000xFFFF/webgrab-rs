@@ -88,3 +88,8 @@ pub fn walk_files(dir: &std::path::Path, recursive: bool) -> Vec<std::path::Path
     go(dir, recursive, &mut out);
     out
 }
+
+/// "http://x/a#frag" -> "http://x/a"
+pub fn strip_fragment(s: &str) -> &str {
+    s.split('#').next().unwrap_or(s)
+}

@@ -16,6 +16,33 @@ pub const TYPES_CODEC: &[&str] = &[
     ".dll",
 ];
 
+/// Extensions that are files, never web pages (used to tell crawlable links from downloads).
+const NON_PAGE_EXTS: &[&str] = &[
+    ".css", ".js", ".mjs", ".json", ".xml", ".rss", ".atom", ".svg", ".ico", ".map", ".woff",
+    ".woff2", ".ttf", ".otf", ".eot", ".pdf", ".doc", ".docx", ".xls", ".xlsx", ".ppt", ".pptx",
+    ".csv", ".gz", ".tgz", ".tar", ".bz2", ".xz", ".7z", ".iso", ".apk", ".dmg", ".msi", ".bin",
+    ".torrent",
+];
+
+/// Could this link be a web page we can crawl? (http(s), and not a media/archive/asset file).
+/// No extension (`/gallery/`) and unknown extensions count as pages; the crawler double-checks
+/// the Content-Type before reading a response.
+pub fn is_page_link(link: &str) -> bool {
+    if !is_http(link) {
+        return false;
+    }
+    match crate::util::url_ext(link) {
+        None => true,
+        Some(e) => {
+            let e = e.as_str();
+            !(TYPES_VIDEO.contains(&e)
+                || TYPES_IMAGE.contains(&e)
+                || TYPES_OTHER.contains(&e)
+                || NON_PAGE_EXTS.contains(&e))
+        }
+    }
+}
+
 pub fn is_http(link: &str) -> bool {
     Url::parse(link)
         .map(|u| matches!(u.scheme(), "http" | "https"))
@@ -37,6 +64,12 @@ impl Filters {
     pub fn new(cli: &Cli) -> Self {
         let lc = |v: &Vec<String>| v.iter().map(|s| s.to_lowercase()).collect::<Vec<_>>();
         Self { only: lc(&cli.any), must: lc(&cli.must), ignore: lc(&cli.ignore), valid: cli.valid }
+    }
+
+    /// --ignore keywords only (also applied to links the crawler would follow).
+    pub fn ignored(&self, link: &str) -> bool {
+        let l = link.to_lowercase();
+        self.ignore.iter().any(|k| l.contains(k.as_str()))
     }
 
     pub fn passes(&self, link: &str) -> bool {
