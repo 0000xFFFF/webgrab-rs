@@ -23,8 +23,11 @@ webgrab -w [flags]
 | `-t N` | `--threads N` | parallel downloads (default 1) |
 | `-d DIR` | `--dir DIR` | download folder |
 | `-R` | `--recursive` | `--skip` and `--hash-existing` also look in subfolders |
-| `-D N` | `--depth N` | crawl depth (default 0 = only the given page, see below) |
-| | `--external` | with `--depth`: also follow links to other hosts |
+| `-D N` | `--crawl-depth N` | crawl depth (default 0 = only the given page, see below) |
+| | `--crawl-sleep MS` | wait this long before every page request (avoid HTTP 429) |
+| | `--crawl-retry-429` | on HTTP 429 retry the page with exponential backoff + random offset |
+| | `--crawl-retries N` | max retries per page for `--crawl-retry-429` (default 6) |
+| | `--external` | with `--crawl-depth`: also follow links to other hosts |
 | `-u` | `--unique` | queue every URL once |
 | `-n` | `--nodupes` | hash each download; same content already saved -> delete the new file |
 | `-H` | `--hash-existing` | hash files already in `--dir` first |
@@ -44,18 +47,23 @@ User-Agent: `--agent` (`webgrab`), `--agent-firefox`, `--agent-chromium`, `--age
 (the Chromium-family ones also send matching `Sec-CH-UA*` client hints), `--user-agent STRING` (wins).
 Browser versions are constants at the top of `src/ua.rs`.
 
-## Crawling (`--depth`)
+## Crawling (`--crawl-depth`)
 Links on a page are split into **pages** and **files**:
 - pages (crawled): `<a href>`, `<area href>`, `<iframe>`/`<frame>` links that look like web pages
   (no extension, `.html`, `.php`, ... , not media/archive/asset files)
 - files (downloaded): every other link that passes your filters (`--media`, `--any`, `--must`, `--ignore` ...)
 
-`--depth 0` scans only the page you gave (as before), `--depth 1` also scans the pages it links to,
-`--depth 2` the pages those link to, and so on. Each page is visited once, only on the start page's host
+`--crawl-depth 0` scans only the page you gave (as before), `--crawl-depth 1` also scans the pages it links to,
+`--crawl-depth 2` the pages those link to, and so on. Each page is visited once, only on the start page's host
 (`www.` ignored) unless `--external`; files are downloaded from any host. Files are downloaded as soon as a
 page is scanned. `--ignore logout` also keeps the crawler away from matching pages; pages are only saved
-with `--codec`. Use `--unique` so a file shown on many pages is fetched once. `--list --depth N` prints the
+with `--codec`. Use `--unique` so a file shown on many pages is fetched once. `--list --crawl-depth N` prints the
 files found while crawling (progress goes to stderr); for a local .html file add `--base`.
+**Rate limits:** `--crawl-sleep 1500` waits 1.5 s before every page request. `--crawl-retry-429` handles a
+server that answers HTTP 429 anyway: the page is retried after 1 s, 2 s, 4 s ... (max 60 s; a longer
+`Retry-After` from the server wins), each wait plus a random offset (up to 20% + 250 ms) so it isn't a fixed
+rhythm. After `--crawl-retries` failed tries the page is counted as failed and the crawl moves on. These
+apply to page requests only; file downloads are not throttled.
 With `--live-csv`, a re-run re-reads the pages but skips every file already in the CSV.
 
 ## Skip / resume

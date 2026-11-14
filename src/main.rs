@@ -147,7 +147,7 @@ fn page_mode(ctx: &Ctx, input: &str) -> u8 {
         ui.say(K::Inf, &format!("title from html.: {}", title));
     }
 
-    if cli.depth > 0 {
+    if cli.crawl_depth > 0 {
         drop(text);
         return crawl(ctx, base, html);
     }
@@ -168,7 +168,7 @@ fn page_mode(ctx: &Ctx, input: &str) -> u8 {
     finish(ctx, links)
 }
 
-// ------------------------------------------------------------------ crawl (--depth)
+// ------------------------------------------------------------------ crawl (--crawl-depth)
 
 fn host_key(u: &Url) -> Option<String> {
     u.host_str().map(|h| h.trim_start_matches("www.").to_lowercase())
@@ -221,13 +221,58 @@ fn follow_pages(ctx: &Ctx, pages: Vec<String>, host: &Option<String>, visited: &
     out
 }
 
+/// Random number in 0..max (std only: every RandomState has its own random keys).
+fn rand_below(max: u64) -> u64 {
+    use std::collections::hash_map::RandomState;
+    use std::hash::{BuildHasher, Hasher};
+    if max == 0 {
+        return 0;
+    }
+    RandomState::new().build_hasher().finish() % max
+}
+
+/// GET a page. With --crawl-retry-429, an HTTP 429 is retried with exponential backoff
+/// (1s, 2s, 4s ... max 60s, or the server's Retry-After if longer) plus a random offset.
+fn get_page(ctx: &Ctx, url: &str) -> Result<ureq::Response, String> {
+    let cli = ctx.cli;
+    let mut attempt: u32 = 0;
+    loop {
+        match ctx.get(url).call() {
+            Ok(r) => return Ok(r),
+            Err(ureq::Error::Status(429, resp)) if cli.crawl_retry_429 && attempt < cli.crawl_retries => {
+                let backoff = (1000u64 << attempt.min(6)).min(60_000);
+                let asked = resp
+                    .header("retry-after")
+                    .and_then(|v| v.trim().parse::<u64>().ok())
+                    .map(|s| s.saturating_mul(1000).min(120_000))
+                    .unwrap_or(0);
+                let base = backoff.max(asked);
+                let wait = base + rand_below(base / 5 + 250); // + up to 20% and 250 ms
+                attempt += 1;
+                if !cli.clean {
+                    let k = if cli.list || cli.test { K::Err } else { K::War };
+                    ctx.ui.say(
+                        k,
+                        &format!(
+                            "WAR[429] {} - retry {}/{} in {:.1}s",
+                            url, attempt, cli.crawl_retries, wait as f64 / 1000.0
+                        ),
+                    );
+                }
+                std::thread::sleep(Duration::from_millis(wait));
+            }
+            Err(ureq::Error::Status(code, _)) => return Err(format!("HTTP {}", code)),
+            Err(e) => return Err(e.to_string()),
+        }
+    }
+}
+
 /// Ok(None) = the response is not HTML (not crawled).
 fn fetch_page(ctx: &Ctx, url: &str) -> Result<Option<(Vec<u8>, Option<Url>)>, String> {
-    let resp = match ctx.get(url).call() {
-        Ok(r) => r,
-        Err(ureq::Error::Status(code, _)) => return Err(format!("HTTP {}", code)),
-        Err(e) => return Err(e.to_string()),
-    };
+    if ctx.cli.crawl_sleep > 0 {
+        std::thread::sleep(Duration::from_millis(ctx.cli.crawl_sleep));
+    }
+    let resp = get_page(ctx, url)?;
     if let Some(ct) = resp.header("content-type") {
         if !ct.to_lowercase().contains("html") {
             return Ok(None);
@@ -266,11 +311,11 @@ fn emit(ctx: &Ctx, files: &[String], collected: &mut Vec<String>, listed: &mut u
     }
 }
 
-/// --depth N: breadth-first crawl. Files of every page are downloaded (or listed) as soon as
+/// --crawl-depth N: breadth-first crawl. Files of every page are downloaded (or listed) as soon as
 /// the page has been scanned, so an interrupted run (with --live-csv) can be resumed.
 fn crawl(ctx: &Ctx, start_base: Option<Url>, start_html: Vec<u8>) -> u8 {
     let (cli, ui, stats) = (ctx.cli, ctx.ui, ctx.stats);
-    let max = cli.depth;
+    let max = cli.crawl_depth;
     let host = start_base.as_ref().and_then(host_key);
 
     let mut visited: HashSet<String> = HashSet::new();
@@ -289,7 +334,7 @@ fn crawl(ctx: &Ctx, start_base: Option<Url>, start_html: Vec<u8>) -> u8 {
     emit(ctx, &files, &mut collected, &mut listed);
     if start_base.is_none() && !pages.is_empty() {
         let k = if cli.list || cli.test { K::Err } else { K::War };
-        ui.say(k, "WAR[--depth] local file without --base: relative links can't be followed");
+        ui.say(k, "WAR[--crawl-depth] local file without --base: relative links can't be followed");
     }
     let mut level = follow_pages(ctx, pages, &host, &mut visited);
 
@@ -360,8 +405,8 @@ fn read_mode(ctx: &Ctx, path: &Path) -> u8 {
             return 1;
         }
     };
-    if cli.depth > 0 {
-        ui.say(K::War, "WAR[--depth] is ignored with --read (every line is downloaded as a file)");
+    if cli.crawl_depth > 0 {
+        ui.say(K::War, "WAR[--crawl-depth] is ignored with --read (every line is downloaded as a file)");
     }
     ui.say(K::Def, "");
     ui.say(K::Top, "===[ SCANNING TEXT FILE ]");

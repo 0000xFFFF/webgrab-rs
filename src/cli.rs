@@ -19,8 +19,9 @@ SKIP / DUPLICATE RULES (what each one checks):
 EXAMPLES:
   webgrab https://example.com/gallery --grab --threads 8
   webgrab https://example.com/gallery --list --image --unique
-  webgrab https://example.com/gallery --depth 2 --image --unique -t 8 -d pics
-  webgrab https://example.com/gallery --depth 1 --list --media --unique
+  webgrab https://example.com/gallery --crawl-depth 2 --image --unique -t 8 -d pics
+  webgrab https://example.com/gallery -D 3 --media -u --crawl-sleep 1500 --crawl-retry-429
+  webgrab https://example.com/gallery --crawl-depth 1 --list --media --unique
   webgrab page.html --list --base https://example.com/ --video
   webgrab --live-csv data.csv --nodupes --unique download_links.html
   webgrab --read urls.txt --media -t 4 -d downloads --live-csv log.csv --hash-existing -R
@@ -125,9 +126,25 @@ pub struct Cli {
     /// downloaded once. --ignore also applies to pages (e.g. --ignore logout). Pages are not
     /// saved unless you add --codec. Applies to a page URL / .html file, not to --read.
     #[arg(short = 'D', long, default_value_t = 0, value_name = "NUM", help_heading = "Download")]
-    pub depth: usize,
+    pub crawl_depth: usize,
 
-    /// With --depth: also follow links to other hosts (default: stay on the start page's host)
+    /// With --crawl-depth: wait this many milliseconds before every page request (avoids HTTP 429)
+    #[arg(long, default_value_t = 0, value_name = "MS", help_heading = "Download")]
+    pub crawl_sleep: u64,
+
+    /// With --crawl-depth: when a page answers HTTP 429, wait and try again
+    ///
+    /// The wait doubles every time (1s, 2s, 4s ... max 60s), a Retry-After header from the
+    /// server is respected if it asks for longer, and a random offset is added to every wait
+    /// so the timing is never exactly the same.
+    #[arg(long, help_heading = "Download")]
+    pub crawl_retry_429: bool,
+
+    /// With --crawl-retry-429: how many times to retry one page before giving up
+    #[arg(long, default_value_t = 6, value_name = "NUM", help_heading = "Download")]
+    pub crawl_retries: u32,
+
+    /// With --crawl-depth: also follow links to other hosts (default: stay on the start page's host)
     #[arg(long, help_heading = "Download")]
     pub external: bool,
 
